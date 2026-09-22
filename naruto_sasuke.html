@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Jutsu Control</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', system-ui, sans-serif; }
+
+    #v_src, #out {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      object-fit: cover; transform: scaleX(-1);
+    }
+    #out { z-index: 2; pointer-events: none; }
+
+    .darkness {
+      position: absolute; top: 0; left: 0;
+      width: 100vw; height: 100vh;
+      background: rgba(10, 5, 0, 0.3);
+      mix-blend-mode: multiply; pointer-events: none; z-index: 5;
+    }
+
+    .fx {
+      position: absolute; height: auto; top: 0; left: 0;
+      transform: translate(-50%, -50%);
+      pointer-events: none; display: none;
+      mix-blend-mode: screen; z-index: 20;
+    }
+    #n { width: 1600px; }
+    #s { width: 2400px; }
+
+    #shk {
+      position: absolute; top: 0; left: 0;
+      width: 110px; height: auto;
+      transform: translate(-50%, -50%);
+      pointer-events: none; display: none;
+      mix-blend-mode: screen; z-index: 22;
+    }
+
+    #hint {
+      position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+      color: #cbb98e; font-size: 13px; opacity: 0.75; z-index: 30;
+      text-align: center; pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+
+  <video id="v_src" autoplay playsinline muted></video>
+  <canvas id="out"></canvas>
+  <div class="darkness"></div>
+
+  <video id="n" class="fx" src="naruto.mp4" loop playsinline preload="auto"></video>
+  <video id="s" class="fx" src="sasuke.mp4" loop playsinline preload="auto"></video>
+  <video id="shk" src="shuriken.mp4"loop muted playsinline preload="auto"></video>
+  <audio id="chidoriSnd" src="chidori.mp3" preload="auto"></audio>
+  <audio id="shurikenSnd" src="shuriken.mp3" preload="auto"></audio>
+
+  <div id="hint">Left hand open = Naruto &nbsp;|&nbsp; Right hand open = Sasuke &nbsp;|&nbsp; Charge left hand fully, then flick fast to throw a shuriken &nbsp;|&nbsp; Tap anywhere once to enable sound</div>
+
+  <script>
+    const vElement = document.getElementById('v_src');
+    const cElement = document.getElementById('out');
+    const ctx = cElement.getContext('2d');
+    const n = document.getElementById('n');
+    const s = document.getElementById('s');
+    const shk = document.getElementById('shk');
+    const chidoriSnd = document.getElementById('chidoriSnd');
+    const shurikenSnd = document.getElementById('shurikenSnd');
+
+    // Both effect videos carry their own audio, except Sasuke's clip: we mute its
+    // built-in track and use the dedicated Chidori sound file instead.
+    n.volume = 1.0;
+    s.volume = 1.0;
+    s.muted = true;
+    chidoriSnd.volume = 1.0;
+    shurikenSnd.volume = 1.0;
+
+    let pwr = [0, 0];
+    let wasOpen = [false, false];
+    let cameraStarted = false;
+
+    // --- Shuriken throw state ---
+    let shuriken = null;               // { nx, ny, dirX, dirY, angle } or null when not in flight
+    let prevWristPos = [null, null];   // last known wrist pixel position + timestamp, per hand
+    let lastThrowTime = [0, 0];
+    let lastFrameTs = performance.now();
+    const THROW_POWER_MIN = 0.85;       // rasengan must be nearly/fully charged
+    const THROW_SPEED_THRESHOLD = 900;  // px/sec flick speed needed to trigger a throw
+    const THROW_COOLDOWN_MS = 700;      // minimum time between throws
+    const SHURIKEN_TRAVEL_SPEED = 1.1;  // normalized screen-widths per second
+    const SHURIKEN_SPIN_DEG = 720;      // extra visual spin, degrees/sec (on top of the clip's own motion)
+
+    function checkOpen(pts) {
+      let count = 0;
+      const wrist = pts[0];
+      const tips = [8, 12, 16, 20];
+      const pips = [6, 10, 14, 18];
+      for (let i = 0; i < tips.length; i++) {
+        const tip = pts[tips[i]];
+        const pip = pts[pips[i]];
+        if (Math.hypot(tip.x - wrist.x, tip.y - wrist.y) > Math.hypot(pip.x - wrist.x, pip.y - wrist.y)) count++;
+      }
+      return count >= 3;
+    }
+
+    function triggerJutsu(vid, companionAudio) {
+      // Restart the clip (video + audio together) from the beginning every time the hand opens.
+      vid.pause();
+      vid.currentTime = 0;
+      const playPromise = vid.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(err => console.warn('Playback blocked:', err));
+      }
+      if (companionAudio) {
+        companionAudio.loop = true;
+        companionAudio.pause();
+        companionAudio.currentTime = 0;
+        const audioPromise = companionAudio.play();
+        if (audioPromise !== undefined) {
+          audioPromise.catch(err => console.warn('Audio playback blocked:', err));
+        }
+      }
+    }
+
+    function updateAndDrawShuriken(dt) {
+      if (!shuriken) return;
+
+      shuriken.nx += shuriken.dirX * SHURIKEN_TRAVEL_SPEED * dt;
+      shuriken.ny += shuriken.dirY * SHURIKEN_TRAVEL_SPEED * dt;
+      shuriken.angle += SHURIKEN_SPIN_DEG * dt;
+
+      const onScreen = shuriken.nx > -0.2 && shuriken.nx < 1.2 && shuriken.ny > -0.2 && shuriken.ny < 1.2;
+
+      if (!onScreen) {
+        shuriken = null;
+        shk.style.display = 'none';
+        if (!shk.paused) shk.pause();
+        return;
+      }
+
+      // Mirror-correct the same way the naruto/sasuke overlay clips do.
+      shk.style.left = `${(1 - shuriken.nx) * window.innerWidth}px`;
+      shk.style.top = `${shuriken.ny * window.innerHeight}px`;
+      shk.style.transform = `translate(-50%, -50%) rotate(${shuriken.angle}deg)`;
+      shk.style.display = 'block';
+    }
+
+    function onResults(res) {
+      cElement.width = vElement.videoWidth;
+      cElement.height = vElement.videoHeight;
+      ctx.save();
+      ctx.clearRect(0, 0, cElement.width, cElement.height);
+
+      let fL = false;
+      let fR = false;
+
+      if (res.multiHandLandmarks && res.multiHandedness) {
+        res.multiHandLandmarks.forEach((pts, i) => {
+          const label = res.multiHandedness[i].label;
+          const isR = label === 'Right';
+          const idx = isR ? 1 : 0;
+
+          // --- BRIGHT BLUE SKELETON ---
+          ctx.save();
+          ctx.shadowBlur = 10;
+          ctx.shadowColor = '#00fbff';
+          drawConnectors(ctx, pts, HAND_CONNECTIONS, {color: '#00d4ff', lineWidth: 3});
+          drawLandmarks(ctx, pts, {color: '#ffffff', lineWidth: 1, radius: 2});
+          ctx.restore();
+
+          const open = checkOpen(pts);
+          pwr[idx] += open ? 0.05 : -0.15;
+          pwr[idx] = Math.max(0, Math.min(1, pwr[idx]));
+
+          if (open && !wasOpen[idx]) {
+            if (isR) {
+              triggerJutsu(s, chidoriSnd);
+            } else {
+              triggerJutsu(n);
+              shurikenSnd.loop = false;
+              shurikenSnd.pause();
+              shurikenSnd.currentTime = 0;
+              const shurikenSndPromise = shurikenSnd.play();
+              if (shurikenSndPromise !== undefined) shurikenSndPromise.catch(err => console.warn('Shuriken sound blocked:', err));
+            }
+          }
+          wasOpen[idx] = open;
+
+          const wrist = pts[0];
+          const knk = pts[9];
+
+          // --- Shuriken throw: only Naruto's hand (idx 0), only at peak charge, only on a fast flick ---
+          if (idx === 0) {
+            const wristPx = { x: wrist.x * cElement.width, y: wrist.y * cElement.height };
+            const nowTs = performance.now();
+            if (prevWristPos[0]) {
+              const dt = (nowTs - prevWristPos[0].t) / 1000;
+              if (dt > 0) {
+                const vx = (wristPx.x - prevWristPos[0].x) / dt;
+                const vy = (wristPx.y - prevWristPos[0].y) / dt;
+                const speed = Math.hypot(vx, vy);
+                const readyToThrow = pwr[0] >= THROW_POWER_MIN &&
+                  speed > THROW_SPEED_THRESHOLD &&
+                  (nowTs - lastThrowTime[0]) > THROW_COOLDOWN_MS;
+
+                if (readyToThrow) {
+                  const dirLen = speed || 1;
+                  shuriken = {
+                    nx: wrist.x,
+                    ny: wrist.y,
+                    dirX: vx / dirLen,
+                    dirY: vy / dirLen,
+                    angle: 0
+                  };
+                  shk.currentTime = 0;
+                  const shkPromise = shk.play();
+                  if (shkPromise !== undefined) shkPromise.catch(err => console.warn('Shuriken playback blocked:', err));
+
+                  lastThrowTime[0] = nowTs;
+
+                  // Releasing the shuriken discharges the Rasengan build-up.
+                  pwr[0] = 0;
+                  wasOpen[0] = false;
+                  n.style.display = 'none';
+                  if (!n.paused) n.pause();
+                }
+              }
+            }
+            prevWristPos[0] = { x: wristPx.x, y: wristPx.y, t: nowTs };
+          }
+
+          if (pwr[idx] > 0.01) {
+            if (isR) {
+              fR = true;
+              const tx = (wrist.x + knk.x) / 2;
+              const ty = (wrist.y + knk.y) / 2;
+              s.style.left = `${(1 - tx) * window.innerWidth}px`;
+              s.style.top = `${ty * window.innerHeight}px`;
+              s.style.display = 'block';
+              s.style.opacity = pwr[idx];
+            } else {
+              fL = true;
+              const dx = knk.x - wrist.x;
+              const dy = knk.y - wrist.y;
+              const tx = knk.x + (dx * 0.8);
+              const ty = knk.y + (dy * 0.8);
+              n.style.left = `${(1 - tx) * window.innerWidth}px`;
+              n.style.top = `${(ty * window.innerHeight) - 120}px`;
+              n.style.display = 'block';
+              n.style.opacity = pwr[idx];
+            }
+          }
+        });
+      }
+
+      if (!fL) {
+        pwr[0] = Math.max(0, pwr[0] - 0.15);
+        if (pwr[0] > 0.01) {
+          n.style.display = 'block';
+          n.style.opacity = pwr[0];
+        } else {
+          n.style.display = 'none';
+          if (!n.paused) n.pause();
+        }
+        wasOpen[0] = false;
+      }
+      if (!fR) {
+        pwr[1] = Math.max(0, pwr[1] - 0.15);
+        if (pwr[1] > 0.01) {
+          s.style.display = 'block';
+          s.style.opacity = pwr[1];
+        } else {
+          s.style.display = 'none';
+          if (!s.paused) s.pause();
+          if (!chidoriSnd.paused) chidoriSnd.pause();
+        }
+        wasOpen[1] = false;
+      }
+
+      // --- Advance and position the shuriken clip if one is in flight ---
+      const frameNow = performance.now();
+      const dt = Math.min((frameNow - lastFrameTs) / 1000, 0.05); // cap to avoid jumps on lag spikes
+      lastFrameTs = frameNow;
+      updateAndDrawShuriken(dt);
+
+      ctx.restore();
+    }
+
+    const h = new Hands({
+      locateFile: (f) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`
+    });
+
+    h.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.65,
+      minTrackingConfidence: 0.65
+    });
+
+    h.onResults(onResults);
+
+    let cam;
+    let audioUnlocked = false;
+
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      audioUnlocked = true;
+      // play-then-immediately-pause is a standard trick to satisfy autoplay policies.
+      [n, s, chidoriSnd, shurikenSnd].forEach(el => {
+        el.play().then(() => el.pause()).catch(() => {});
+      });
+    }
+
+    function startExperience() {
+      if (cameraStarted) return;
+      cameraStarted = true;
+
+      unlockAudio(); // works immediately in browsers that allow it; harmless no-op otherwise
+
+      cam = new Camera(vElement, {
+        onFrame: async () => { await h.send({ image: vElement }); },
+        width: 1280,
+        height: 720
+      });
+      cam.start();
+    }
+
+    // No start screen: launch the camera as soon as the page loads.
+    startExperience();
+
+    // Fallback for browsers that refuse to unlock audio without a real user gesture:
+    // the first click/tap/keypress anywhere on the page unlocks it silently.
+    ['click', 'touchstart', 'keydown'].forEach(evt => {
+      document.addEventListener(evt, unlockAudio, { once: true });
+    });
+  </script>
+</body>
+</html>
